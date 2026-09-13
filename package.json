@@ -1,0 +1,12 @@
+{
+  "name": "monster-grind-server",
+  "version": "0.1.0",
+  "description": "Step 1 minimal WebSocket connection-test server for Monster Grind's multiplayer network foundation. No rooms or gameplay sync yet.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
