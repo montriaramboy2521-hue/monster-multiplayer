@@ -4,11 +4,78 @@
  * STEP 1 (done): WebSocket connection test only (DISCONNECTED/CONNECTING/CONNECTED/RECONNECTING).
  * STEP 2 (done): CREATE ROOM / JOIN ROOM / LEAVE ROOM, with a 4-player cap per room.
  * STEP 3 (done): PLAYER SYNC — position/rotation/animation broadcast to everyone else in a room.
- * STEP 4 (this update): MONSTER SYNC — the room HOST's existing single-player monster
- *                        spawn/AI keeps running completely unchanged; this server just
- *                        relays a summary of it (spawn/state/despawn) to everyone else in
- *                        the same room, and caches it so late joiners see monsters instantly.
- *                        Still no combat/damage/EXP/loot exchanged.
+ * STEP 4 (previous): MONSTER SYNC — the room HOST's existing single-player monster
+ *                     spawn/AI keeps running completely unchanged; this server just
+ *                     relays a summary of it (spawn/state/despawn) to everyone else in
+ *                     the same room, and caches it so late joiners see monsters instantly.
+ * STEP 4 BUGFIX (previous): a joining player wasn't seeing the host's monsters. Root
+ *                     cause was client-side (loadWorld() running twice on the host's first
+ *                     PLAY press, orphaning the first batch of monsters on the server without
+ *                     ever despawning them) — fixed in monster-rpg-19-3.html. This server
+ *                     update adds 'requestMonsterSnapshot' as a robust, explicit pull so a
+ *                     joining client can always ask for the room's current monster list the
+ *                     moment it's ready to render one, instead of relying only on the
+ *                     automatic push at join time.
+ * STEP 5 (previous, client-only): MONSTER TARGETING — the host's monster AI now picks
+ *                     the nearest player (itself or any remote player) as a target instead
+ *                     of always the host. This server needed NO changes: it already relays
+ *                     whatever fields are on a monster object verbatim (monsterSpawn/
+ *                     monsterState/monsterSnapshot), so the new `targetPlayerId` field on
+ *                     each monster payload just flows through the existing relay untouched.
+ *                     Still no real damage/HP applied to remote players — see client comments.
+ * DAY/NIGHT SYNC (previous, v2 — bugfix): v1 sent a Date.now()-based timestamp and had
+ *                     each client derive elapsed time from (Date.now() - origin). Real
+ *                     2-device testing showed this fails whenever the devices' system
+ *                     clocks disagree (very common on phones/tablets) — one device saw day,
+ *                     the other night, despite being in the same room. FIXED by removing
+ *                     all Date.now()/timestamp comparison entirely: every client just keeps
+ *                     ticking Game.timeOfDay locally every frame (same mechanism Single
+ *                     Player always used — driven by requestAnimationFrame's delta time,
+ *                     never by the system clock), and the host periodically broadcasts its
+ *                     current timeOfDay (a plain 0..1 fraction) which every other client
+ *                     hard-snaps to. No wall-clock or timezone value is ever compared
+ *                     across devices. Stored per-room, so Room A and Room B never share a
+ *                     clock. Sent to a joiner immediately on join (same pattern as the
+ *                     monster snapshot), plus an explicit 'requestWorldTime' pull.
+ * ATTACK ANIMATION SYNC (previous): a quick attack could previously fall between two
+ *                     ~12Hz playerState snapshot ticks and never be seen by other players.
+ *                     Fixed with a dedicated one-shot 'playerAttack' event sent the instant
+ *                     a local attack fires (independent of the periodic snapshot), relayed
+ *                     live to the rest of the room only — nothing is cached, since it's a
+ *                     transient animation cue, not persistent state.
+ * MULTIPLAYER COMBAT (previous): host-authoritative. The host's client is the only one
+ *                     with real monster objects, so a non-host's attack ('monsterAttack')
+ *                     is relayed ONLY to that room's host (never broadcast, never trusted
+ *                     to set HP itself) — roomId/playerId always come from the socket's own
+ *                     session, never from the packet. The host applies the hit locally
+ *                     (reusing its existing damage/death code, unchanged) and confirms with
+ *                     'monsterCombatResult', which this server relays to everyone else in
+ *                     the same room. Both messages are transient events (like playerAttack)
+ *                     — nothing is cached, since monster HP itself is already kept in sync
+ *                     via the existing monsterState/monsterSnapshot system.
+ * MULTIPLAYER EXP + LEVEL SYNC (previous): still host-authoritative — only the host ever
+ *                     runs killMonster() (it's the only one with real monster objects), so
+ *                     only the host may award EXP via 'monsterExpAward', and only to players
+ *                     it lists as contributors (tracked client-side from the existing combat
+ *                     hits in STEP 5). Each contributor's own client applies the EXP to
+ *                     itself via the existing gainExp()/level-up code, completely unchanged
+ *                     — this server never computes or stores anyone's level/exp math, it only
+ *                     relays 'playerLevelSync' events (sent on room join and on EXP gain,
+ *                     never per-frame) and remembers each socket's last-known level/exp so a
+ *                     late joiner's playerList snapshot already includes everyone's level.
+ * BUGFIX + NEW FEATURES (this update):
+ *   1. Monster-hits-remote-player bugfix: a monster targeting a guest previously applied no
+ *      damage anywhere. Added 'monsterAttacksPlayer', sent by the host directly to that
+ *      specific player's own socket (found within the SAME room only), so their own client
+ *      applies it to their own real HP.
+ *   2. Player-vs-player (new): each player stays authoritative over their own HP, same
+ *      principle as monster combat. 'playerAttackPlayer' carries only the attacker's own
+ *      atk/crit stats (never a damage number) to the target's socket; the target computes
+ *      real damage using their own def and applies it locally, then 'playerCombatResult'
+ *      relays the confirmed number back to the original attacker so they see it too.
+ *   3. Equipment visual sync (new): 'playerEquipment' carries only a color per slot (no
+ *      stats, no item data) so other players can see actual equipped gear instead of a
+ *      generic look. Stored on the socket like level/exp, included in the join snapshot.
  *
  * Still intentionally NOT implemented (later steps):
  *   - Combat / Damage sync
@@ -25,6 +92,53 @@
  *     { type:'monsterSnapshot', monsters: [ {monsterId,type,x,y,z,rotY,hp,maxHp,state}, ... ] }
  *     { type:'monsterState',   monsterId, x, y, z, rotY, hp, maxHp, state }
  *     { type:'monsterDespawn', monsterId }
+ *
+ *   Client -> Server (any room member — used to explicitly ask for the current list)
+ *     { type:'requestMonsterSnapshot' }
+ *     { type:'worldTime', timeOfDay }        (host only — plain 0..1 fraction, never a timestamp)
+ *     { type:'requestWorldTime' }            (any room member)
+ *
+ *   Client -> Server (attack animation cue)
+ *     { type:'playerAttack', kind }   (kind: 'basic'|'heavy'|'skill1'|'skill2'|'skill3'|'ultimate')
+ *   Server -> Client
+ *     { type:'playerAttack', playerId, kind }   (relayed live, never cached, never echoed to sender)
+ *
+ *   Client -> Server (combat)
+ *     { type:'monsterAttack', monsterId, attackType, damage, crit, attackId }
+ *       (sent by a non-host attacker; playerId is NOT trusted from the packet — the server
+ *        stamps it from the socket's own session before relaying to the room's host)
+ *     { type:'monsterCombatResult', monsterId, attackerId, damage, crit, hp, maxHp }
+ *       (sent ONLY by the room's host, after applying a hit — relayed to everyone else)
+ *   Server -> Client (combat)
+ *     { type:'monsterAttack', monsterId, attackerId, attackType, damage, crit, attackId }
+ *       (sent ONLY to the room's host socket — never broadcast)
+ *     { type:'monsterCombatResult', monsterId, attackerId, damage, crit, hp, maxHp }
+ *       (relayed to every OTHER member of the same room)
+ *
+ *   Client -> Server (EXP/Level)
+ *     { type:'playerLevelSync', level, exp }
+ *   Server -> Client
+ *     { type:'playerLevelSync', playerId, level, exp }   (relayed to every OTHER room member)
+ *     { type:'monsterExpAward', contributorIds:[...], exp }   (host only)
+ *   Server -> Client (individually, never broadcast)
+ *     { type:'expAward', exp }   (sent to each contributing player's own socket)
+ *
+ *   Client -> Server (bugfix: monster hits a remote player)
+ *     { type:'monsterAttacksPlayer', targetPlayerId, damage, monsterId, monsterName }  (host only)
+ *   Server -> Client (individually, never broadcast)
+ *     { type:'monsterAttacksPlayer', targetPlayerId, damage, monsterId, monsterName }
+ *
+ *   Client -> Server (new: player vs player)
+ *     { type:'playerAttackPlayer', targetPlayerId, attackType, atk, critRate, critDmg }
+ *     { type:'playerCombatResult', targetPlayerId, damage, crit }   (sent by the victim)
+ *   Server -> Client (individually, never broadcast)
+ *     { type:'playerAttackPlayer', targetPlayerId, attackerId, attackType, atk, critRate, critDmg }
+ *     { type:'playerCombatResult', targetPlayerId, attackerId, damage, crit }
+ *
+ *   Client -> Server (new: equipment visuals)
+ *     { type:'playerEquipment', equipment:{weapon,armor,helmet,accessory} }  (color per slot only)
+ *   Server -> Client
+ *     { type:'playerEquipment', playerId, equipment }   (relayed to every OTHER room member)
  *
  *   Server -> Client
  *     Same four shapes, relayed to every OTHER member of the room (never echoed back to
@@ -83,7 +197,7 @@ const rooms = new Map();
 const usedPlayerIds = new Set();
 
 console.log(`[Server] Monster Grind test server listening on ws://localhost:${PORT}`);
-console.log('[Server] STEP 4 mode: Room + Player sync + Monster sync (host-authoritative cache) — no combat sync yet.');
+console.log('[Server] STEP 4 mode (bugfix): Room + Player sync + Monster sync with explicit snapshot requests — no combat sync yet.');
 
 function send(socket, obj){
   if(socket.readyState === WebSocket.OPEN){
@@ -112,7 +226,7 @@ function generatePlayerId(){
 }
 
 function createRoomRecord(hostSocket){
-  return { members: new Set([hostSocket]), hostSocket, monsters: new Map() };
+  return { members: new Set([hostSocket]), hostSocket, monsters: new Map(), worldTimeOfDay: 0.28 };
 }
 
 function broadcastRoomUpdate(roomId){
@@ -162,6 +276,11 @@ wss.on('connection', (socket) => {
   socket.roomId = null;
   // STEP 3: last known player transform.
   socket.px = 0; socket.py = 0; socket.pz = 0; socket.prot = 0; socket.panim = 'idle';
+  // STEP 6: last known level/exp (defaults match a fresh character — real values arrive
+  // via 'playerLevelSync' the moment this socket enters a room).
+  socket.level = 1; socket.exp = 0;
+  // New feature: last known equipment visuals (color per slot only — never full item/stats).
+  socket.equipment = { weapon:null, armor:null, helmet:null, accessory:null };
 
   console.log(`[Server] Client connected as ${socket.playerId}. Total clients: ${wss.clients.size}`);
 
@@ -195,11 +314,15 @@ wss.on('connection', (socket) => {
           leaveCurrentRoom(socket, false); // defensive: drop any previous room first
 
           // STEP 3: tell the new joiner about everyone already here, before adding them.
+          // STEP 6: include each existing member's last known level/exp too, so a late
+          // joiner immediately knows the host's (and anyone else's) level without waiting.
           const existingPlayers = [];
           room.members.forEach(memberSocket => existingPlayers.push({
             playerId: memberSocket.playerId,
             x: memberSocket.px, y: memberSocket.py, z: memberSocket.pz,
             rot: memberSocket.prot, anim: memberSocket.panim,
+            level: memberSocket.level, exp: memberSocket.exp,
+            equipment: memberSocket.equipment, // new feature: existing members' gear visuals
           }));
 
           room.members.add(socket);
@@ -215,6 +338,14 @@ wss.on('connection', (socket) => {
             send(socket, { type:'monsterSnapshot', monsters: Array.from(room.monsters.values()) });
             console.log(`[MonsterSync] sent initial snapshot (count=${room.monsters.size}) to ${socket.playerId} joining room ${roomId}`);
           }
+
+          // Day/Night sync (v2 — plain progress fraction, never a wall-clock timestamp):
+          // give the new joiner the room's current World Time immediately so they see the
+          // correct sky (day or night) right away instead of starting their own clock. A
+          // sensible default (0.28) is always set at room creation, so this always has a
+          // real value to send, even before the host's first periodic broadcast.
+          send(socket, { type:'worldTime', timeOfDay: room.worldTimeOfDay });
+          console.log(`[WorldTime] sent timeOfDay=${room.worldTimeOfDay.toFixed(3)} to ${socket.playerId} joining room ${roomId}`);
 
           broadcastRoomUpdate(roomId);
           room.members.forEach(memberSocket => {
@@ -240,6 +371,191 @@ wss.on('connection', (socket) => {
             const payload = playerStatePayload(socket, 'playerState');
             room.members.forEach(memberSocket => { if(memberSocket !== socket) send(memberSocket, payload); });
           }
+          break;
+        }
+
+        // Attack animation sync: a one-shot event, not persistent state — nothing is cached
+        // room-side (unlike monsters/world time), it's just relayed live to everyone else
+        // currently in the SAME room. Never echoed back to the attacker, and a socket not in
+        // any room has nowhere valid to relay to, so it's silently ignored (never crashes).
+        case 'playerAttack': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          const kind = typeof data.kind === 'string' ? data.kind : 'basic';
+          const payload = { type:'playerAttack', playerId: socket.playerId, kind };
+          room.members.forEach(memberSocket => { if(memberSocket !== socket) send(memberSocket, payload); });
+          console.log(`[PlayerAttack] ${socket.playerId} (${kind}) in room ${socket.roomId}`);
+          break;
+        }
+
+        // ---------------- STEP 5: MULTIPLAYER COMBAT ----------------
+        // Host-authoritative: only the client that actually owns the real monster objects
+        // (the room's host) can ever apply damage. A non-host socket's attack is relayed
+        // ONLY to that room's host (never broadcast, never trusted to change HP itself) —
+        // roomId always comes from the socket's own server-side session, never from the
+        // packet, so a player can never target another room's monster (spec section 7).
+        case 'monsterAttack': {
+          if(!socket.roomId) break; // not in a room — nothing valid to attack
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          if(socket === room.hostSocket) break; // the host applies its own attacks locally, never via this path
+          if(typeof data.monsterId !== 'string') break;
+          const payload = {
+            type:'monsterAttack',
+            monsterId: data.monsterId,
+            attackerId: socket.playerId, // authoritative — from the session, never trust a client-supplied playerId
+            attackType: typeof data.attackType === 'string' ? data.attackType : 'basic',
+            damage: typeof data.damage === 'number' ? data.damage : 0,
+            crit: !!data.crit,
+            attackId: typeof data.attackId === 'string' ? data.attackId : undefined,
+          };
+          send(room.hostSocket, payload);
+          console.log(`[COMBAT] Player attack ${socket.playerId} -> monster ${data.monsterId} (room ${socket.roomId})`);
+          break;
+        }
+
+        // The host confirms a combat result; relay to everyone else in the SAME room only
+        // (never cached — like playerAttack, this is a transient event, not persistent state).
+        case 'monsterCombatResult': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room || room.hostSocket !== socket) break; // only the host may confirm combat results
+          if(typeof data.monsterId !== 'string') break;
+          const payload = {
+            type:'monsterCombatResult',
+            monsterId: data.monsterId,
+            attackerId: typeof data.attackerId === 'string' ? data.attackerId : null,
+            damage: typeof data.damage === 'number' ? data.damage : 0,
+            crit: !!data.crit,
+            hp: typeof data.hp === 'number' ? data.hp : 0,
+            maxHp: typeof data.maxHp === 'number' ? data.maxHp : 0,
+          };
+          room.members.forEach(memberSocket => { if(memberSocket !== socket) send(memberSocket, payload); });
+          console.log(`[COMBAT] Combat result monster=${data.monsterId} hp=${payload.hp}/${payload.maxHp} room=${socket.roomId}`);
+          break;
+        }
+
+        // BUGFIX: a monster targeting a remote player previously had nowhere to send that
+        // damage — this routes it directly to that specific player's own socket so THEIR
+        // client applies it to their own real HP (only the room's host may send this, same
+        // authority check as the other combat messages; targetPlayerId is matched against
+        // this room's own members only, so it can never reach another room).
+        case 'monsterAttacksPlayer': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room || room.hostSocket !== socket) break; // only the host's monsters may deal damage
+          if(typeof data.targetPlayerId !== 'string') break;
+          const targetSocket = Array.from(room.members).find(s => s.playerId === data.targetPlayerId);
+          if(!targetSocket) break; // that player isn't (or is no longer) in this room — nothing to do
+          const damage = Math.max(1, Math.min(Number(data.damage)||0, 999999));
+          send(targetSocket, {
+            type:'monsterAttacksPlayer', targetPlayerId: data.targetPlayerId,
+            damage, monsterId: data.monsterId, monsterName: typeof data.monsterName==='string' ? data.monsterName : undefined,
+          });
+          console.log(`[COMBAT] Monster hit ${data.targetPlayerId} for ${damage} (room ${socket.roomId})`);
+          break;
+        }
+
+        // ---------------- NEW FEATURE: PLAYER vs PLAYER ----------------
+        // Each player stays authoritative over their own HP (same principle as the host
+        // being authoritative over monster HP): the attacker only sends their own attack
+        // power, never a damage number to apply — the VICTIM's own client computes real
+        // damage using their own def/crit and applies it to themselves, then confirms back
+        // so the attacker sees a number too. targetPlayerId/attackerId are always resolved
+        // against this room's own members, so PvP can never cross into another room.
+        case 'playerAttackPlayer': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          if(typeof data.targetPlayerId !== 'string') break;
+          const targetSocket = Array.from(room.members).find(s => s.playerId === data.targetPlayerId);
+          if(!targetSocket || targetSocket === socket) break; // not in this room, or attacking yourself — ignore
+          send(targetSocket, {
+            type:'playerAttackPlayer', targetPlayerId: data.targetPlayerId, attackerId: socket.playerId,
+            attackType: typeof data.attackType==='string' ? data.attackType : 'basic',
+            atk: Number(data.atk)||0, critRate: Number(data.critRate)||5, critDmg: Number(data.critDmg)||150,
+          });
+          console.log(`[PVP] ${socket.playerId} attacked ${data.targetPlayerId} (room ${socket.roomId})`);
+          break;
+        }
+        case 'playerCombatResult': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          if(typeof data.targetPlayerId !== 'string') break; // this is the ORIGINAL ATTACKER's playerId
+          const attackerSocket = Array.from(room.members).find(s => s.playerId === data.targetPlayerId);
+          if(!attackerSocket) break;
+          send(attackerSocket, {
+            type:'playerCombatResult', targetPlayerId: data.targetPlayerId,
+            attackerId: socket.playerId, // the victim's own id — lets the original attacker know who confirmed
+            damage: Math.max(0, Number(data.damage)||0), crit: !!data.crit,
+          });
+          console.log(`[PVP] Combat result ${socket.playerId} -> ${data.targetPlayerId} dmg=${data.damage} (room ${socket.roomId})`);
+          break;
+        }
+
+        // ---------------- STEP 6: MULTIPLAYER EXP + LEVEL SYNC ----------------
+        // A player's level/exp changed (on room join, or after gaining EXP/leveling up —
+        // never every frame, per spec section 7). Stored on the socket itself (same pattern
+        // as px/py/pz for position) so a future joiner's playerList snapshot can include it,
+        // then relayed live to every OTHER member of the same room.
+        case 'playerLevelSync': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          if(typeof data.level === 'number') socket.level = data.level;
+          if(typeof data.exp === 'number') socket.exp = data.exp;
+          const payload = { type:'playerLevelSync', playerId: socket.playerId, level: socket.level, exp: socket.exp };
+          room.members.forEach(memberSocket => { if(memberSocket !== socket) send(memberSocket, payload); });
+          console.log(`[EXP] ${socket.playerId} is now Lv.${socket.level} (room ${socket.roomId})`);
+          break;
+        }
+
+        // New feature: EQUIPMENT VISUAL SYNC. Only color-per-slot is ever sent (no stats,
+        // no full item data) — stored on the socket (same pattern as level/exp) so a late
+        // joiner's playerList snapshot already shows everyone's current gear.
+        case 'playerEquipment': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          if(data.equipment && typeof data.equipment === 'object'){
+            const eq = { weapon:null, armor:null, helmet:null, accessory:null };
+            for(const slot of ['weapon','armor','helmet','accessory']){
+              const it = data.equipment[slot];
+              if(it && typeof it.color === 'number') eq[slot] = { color: it.color };
+            }
+            socket.equipment = eq;
+          }
+          const payload = { type:'playerEquipment', playerId: socket.playerId, equipment: socket.equipment };
+          room.members.forEach(memberSocket => { if(memberSocket !== socket) send(memberSocket, payload); });
+          console.log(`[Equip] ${socket.playerId} equipment updated (room ${socket.roomId})`);
+          break;
+        }
+
+        // Host-authoritative EXP distribution (spec section 3): only the room's host may
+        // award EXP, and only to players actually in that same room — a client can never
+        // just claim "I killed it, give me EXP" and have the server believe it. Each
+        // contributor's own client applies the EXP to itself via gainExp() on receipt
+        // (see 'expAward' below) — this server never touches anyone's level/exp math.
+        case 'monsterExpAward': {
+          if(!socket.roomId) break;
+          const room = rooms.get(socket.roomId);
+          if(!room || room.hostSocket !== socket) break; // only the host may award EXP
+          if(!Array.isArray(data.contributorIds) || typeof data.exp !== 'number') break;
+          const exp = Math.max(0, Math.min(data.exp, 1000000)); // sanity cap, same spirit as the combat damage cap
+          let awardedTo = 0;
+          data.contributorIds.forEach(pid => {
+            if(typeof pid !== 'string') return;
+            for(const memberSocket of room.members){
+              if(memberSocket !== room.hostSocket && memberSocket.playerId === pid){
+                send(memberSocket, { type:'expAward', exp });
+                awardedTo++;
+                break;
+              }
+            }
+          });
+          console.log(`[EXP] Monster reward distributed: ${exp} EXP -> ${awardedTo} player(s) in room ${socket.roomId}`);
           break;
         }
 
@@ -296,6 +612,44 @@ wss.on('connection', (socket) => {
             if(memberSocket !== socket) send(memberSocket, { type:'monsterDespawn', monsterId });
           });
           console.log(`[MonsterSync] despawn monsterId=${monsterId} room=${socket.roomId}`);
+          break;
+        }
+
+        // Day/Night sync (v2 — plain progress fraction, never a wall-clock timestamp): only
+        // the room's host may set World Time (mirrors the monster-sync authority check).
+        // Stored per-room so Room A and Room B never share a clock, and relayed to every
+        // OTHER member — never echoed back to the host that sent it.
+        case 'worldTime': {
+          const room = rooms.get(socket.roomId);
+          if(!room || room.hostSocket !== socket) break;
+          if(typeof data.timeOfDay !== 'number') break; // malformed packet safety
+          room.worldTimeOfDay = ((data.timeOfDay % 1) + 1) % 1;
+          room.members.forEach(memberSocket => {
+            if(memberSocket !== socket) send(memberSocket, { type:'worldTime', timeOfDay: room.worldTimeOfDay });
+          });
+          console.log(`[WorldTime] timeOfDay=${room.worldTimeOfDay.toFixed(3)} set for room ${socket.roomId}`);
+          break;
+        }
+
+        // Explicit pull — any room member (usually a joiner) can ask for the current World
+        // Time at any moment; always answered from the room's cached value, no host round-trip needed.
+        case 'requestWorldTime': {
+          const room = rooms.get(socket.roomId);
+          if(!room) break;
+          send(socket, { type:'worldTime', timeOfDay: room.worldTimeOfDay });
+          console.log(`[WorldTime] Request from ${socket.playerId} -> sent timeOfDay=${room.worldTimeOfDay.toFixed(3)}`);
+          break;
+        }
+
+        // Explicit pull, requested by a joining client right when it's ready to render the
+        // answer — independent of the automatic push already sent at join time (which is
+        // skipped if the room had 0 monsters at that exact moment). Always answers, even
+        // with an empty list, so the client can confirm "0 monsters" rather than guessing.
+        case 'requestMonsterSnapshot': {
+          const room = rooms.get(socket.roomId);
+          const list = room ? Array.from(room.monsters.values()) : [];
+          send(socket, { type:'monsterSnapshot', monsters: list });
+          console.log(`[MonsterSync] Request snapshot from ${socket.playerId} -> sent ${list.length} monster(s)`);
           break;
         }
 
